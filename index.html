@@ -30,6 +30,7 @@
   td.state { color: var(--c); }
   td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
   tr.sub td:first-child { padding-left: 24px; color: var(--muted); }
+  tr.project td { color: var(--gold); background: #1d1913; font-variant: small-caps; letter-spacing: .08em; padding-top: 9px; }
 </style>
 </head>
 <body>
@@ -46,9 +47,9 @@
     <b style="--c:var(--waiting)">awaits thee</b><span>your turn</span>
     <b style="--c:var(--blocked)">beset</b><span>stuck, permission?</span>
   </div>
-  <div class="roles">Crowned monarch = session (<span style="color:#e0b35a">crimson carpet: Claude Code</span> · <span style="color:#c9ced6">blue carpet: Cursor</span>) · Knight = general-purpose · Ranger = Explore · Wizard = Plan · Monk = any other subagent</div>
+  <div class="roles">Crowned monarch = session (<span style="color:#e0b35a">crimson carpet: Claude Code</span> · <span style="color:#c9ced6">blue carpet: Cursor</span> · <span style="color:#b7efe2">teal carpet: Cursor Cloud</span>) · Knight = general-purpose · Ranger = Explore · Wizard = Plan · Monk = any other subagent</div>
 </header>
-<div id="stage"><canvas id="c"></canvas><div id="empty">The hall stands empty. Begin a Claude Code or Cursor agent and a new arrival shall pass through the gate.</div></div>
+<div id="stage"><canvas id="c"></canvas><div id="empty">The hall stands empty. Begin a Claude Code, Cursor, or Cursor cloud agent and a new arrival shall pass through the gate.</div></div>
 <table><thead><tr><th>agent</th><th>house</th><th>project</th><th>state</th><th>tool</th><th>for</th></tr></thead><tbody id="rows"></tbody></table>
 
 <script>
@@ -83,6 +84,7 @@ const ROLE_NAME = { monarch: 'Monarch', knight: 'Knight', ranger: 'Ranger', wiza
 const HOUSE = {
   claude: { name: 'Claude Code', trim: '#d9a441', outer: '#7a1f2b', inner: '#8f2a36' },
   cursor: { name: 'Cursor', trim: '#c9ced6', outer: '#1d2f66', inner: '#26407f' },
+  'cursor-cloud': { name: 'Cursor Cloud', trim: '#b7efe2', outer: '#14524c', inner: '#1e6d64' },
 };
 const houseOf = a => HOUSE[a?.source] || HOUSE.claude;
 const fmtDur = ms => ms < 60e3 ? Math.round(ms / 1e3) + 's' : ms < 3600e3 ? Math.round(ms / 60e3) + 'm' : (ms / 3600e3).toFixed(1) + 'h';
@@ -101,24 +103,58 @@ const w = world.getContext('2d');
 let snap = { agents: [] };
 const sprites = new Map();
 
-// Each session gets a row: its desk first, then its subagents' desks.
-function layout() {
-  const sessions = snap.agents.filter(a => a.kind === 'session')
-    .sort((a, b) => a.key.localeCompare(b.key));
-  const seats = new Map();
-  let row = 0, maxCols = 4;
-  for (const s of sessions) {
-    const subs = snap.agents.filter(a => a.kind === 'subagent' && a.sessionKey === s.key)
-      .sort((a, b) => a.key.localeCompare(b.key));
-    const perRow = 7;
-    seats.set(s.key, { col: 0, row });
-    subs.forEach((a, i) => seats.set(a.key, { col: 1 + (i % perRow), row: row + Math.floor(i / perRow) }));
-    maxCols = Math.max(maxCols, 1 + Math.min(subs.length, perRow));
-    row += Math.max(1, Math.ceil(subs.length / perRow));
-  }
-  return { seats, rows: Math.max(row, 1), cols: maxCols };
+const MAX_SCALE = 4, SUBS_PER_ROW = 7, PROJECT_H = 18;
+function stageAvail() {
+  return Math.max(320, document.getElementById('stage').clientWidth - 34);
 }
-const deskXY = (seat) => ({ x: LEFT + seat.col * COL_W, y: TOP + seat.row * ROW_H });
+// Desks that fit across the window when sprites are drawn at the largest scale.
+function columnsThatFit() {
+  const worldW = Math.floor(stageAvail() / MAX_SCALE);
+  return Math.max(1, Math.floor((worldW - LEFT - 20) / COL_W));
+}
+const projectOf = a => (a?.project || '').trim() || 'Unassigned';
+function projectGroups() {
+  const byProject = new Map();
+  for (const s of snap.agents.filter(a => a.kind === 'session')) {
+    const project = projectOf(s);
+    if (!byProject.has(project)) byProject.set(project, []);
+    byProject.get(project).push(s);
+  }
+  return [...byProject.entries()]
+    .sort(([a], [b]) => a === 'Unassigned' ? 1 : b === 'Unassigned' ? -1 : a.localeCompare(b))
+    .map(([project, sessions]) => ({ project, sessions: sessions.sort((a, b) => a.key.localeCompare(b.key)) }));
+}
+// Each project gets a labeled ward. Sessions sit side by side within it until
+// the row is full, then wrap. Subagents stay beside their monarch.
+function layout() {
+  const seats = new Map();
+  const sections = [];
+  const fit = columnsThatFit();
+  let y = 0, maxCols = 1;
+  for (const group of projectGroups()) {
+    sections.push({ name: group.project, y: TOP + y });
+    y += PROJECT_H;
+    let x = 0, rowY = 0, rowH = 0;
+    for (const s of group.sessions) {
+      const subs = snap.agents.filter(a => a.kind === 'subagent' && a.sessionKey === s.key)
+        .sort((a, b) => a.key.localeCompare(b.key));
+      const width = 1 + Math.min(subs.length, SUBS_PER_ROW);
+      const height = Math.max(1, Math.ceil(subs.length / SUBS_PER_ROW));
+      if (x > 0 && x + width > fit) { rowY += rowH; x = 0; rowH = 0; }
+      seats.set(s.key, { col: x, y: y + rowY * ROW_H });
+      subs.forEach((a, i) => seats.set(a.key, {
+        col: x + 1 + (i % SUBS_PER_ROW),
+        y: y + (rowY + Math.floor(i / SUBS_PER_ROW)) * ROW_H,
+      }));
+      x += width;
+      rowH = Math.max(rowH, height);
+      maxCols = Math.max(maxCols, x);
+    }
+    y += (rowY + Math.max(rowH, 1)) * ROW_H;
+  }
+  return { seats, sections, contentH: Math.max(y, ROW_H), cols: maxCols };
+}
+const deskXY = (seat) => ({ x: LEFT + seat.col * COL_W, y: TOP + seat.y });
 const seatXY = (seat) => { const d = deskXY(seat); return { x: d.x + 20, y: d.y + 26 }; };
 
 // ---------- drawing primitives ----------
@@ -163,6 +199,15 @@ function drawRoom(W, H, t) {
   px(sx + 6, 9, 1, 7, '#d9a441'); px(sx + 4, 11, 5, 1, '#d9a441');
   const bx = W - 16, by = WALL_H + 2;
   px(bx, by, 10, 12, '#6b4526'); px(bx + 1, by, 8, 1, '#835633'); px(bx, by + 3, 10, 1, '#2b2b2b'); px(bx, by + 8, 10, 1, '#2b2b2b');
+}
+
+function drawProjectBands(sections, W) {
+  for (const section of sections) {
+    px(0, section.y, W, PROJECT_H - 2, '#302b24');
+    px(0, section.y, W, 1, '#6a5a3e');
+    px(0, section.y + PROJECT_H - 3, W, 1, '#211d18');
+    bits(LEFT - 10, section.y + 4, ['..#..', '.###.', '#####', '.#.#.'], '#d9a441');
+  }
 }
 
 function drawGate() {
@@ -419,13 +464,13 @@ let loadedOnce = false, lastT = performance.now();
 function frame(t) {
   // Background tabs throttle rAF hard, so walking is paced by wall time, not frames.
   const dt = Math.min(5, (t - lastT) / 1000); lastT = t;
-  const { seats, rows, cols } = layout();
+  const { seats, sections, contentH, cols } = layout();
   syncSprites(seats);
   step(dt);
 
-  const W = Math.max(LEFT + cols * COL_W + 20, 320), H = TOP + rows * ROW_H + 8;
-  const avail = Math.max(320, document.getElementById('stage').clientWidth - 34);
-  const scale = Math.max(1, Math.min(4, Math.floor(avail / W)));
+  const W = Math.max(LEFT + cols * COL_W + 20, 320), H = TOP + contentH + 8;
+  const avail = stageAvail();
+  const scale = Math.max(1, Math.min(MAX_SCALE, Math.floor(avail / W)));
   const dpr = window.devicePixelRatio || 1;
   if (world.width !== W || world.height !== H) { world.width = W; world.height = H; }
   const cw = W * scale, ch = H * scale;
@@ -434,6 +479,7 @@ function frame(t) {
   }
 
   drawRoom(W, H, t);
+  drawProjectBands(sections, W);
   // desks first, then people back-to-front so heads overlap desks below them
   for (const a of snap.agents) drawDesk(deskXY(seats.get(a.key)), a, t);
   const ordered = [...sprites.values()].sort((a, b) => a.pos.y - b.pos.y);
@@ -452,8 +498,13 @@ function frame(t) {
 
   // Labels are drawn at device resolution so they stay crisp.
   const k = scale * dpr;
-  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
   ctx.shadowColor = 'rgba(0,0,0,.8)'; ctx.shadowOffsetY = dpr;
+  ctx.font = `bold ${Math.round(11 * dpr)}px ${SERIF}`;
+  ctx.fillStyle = css('--gold');
+  for (const section of sections) ctx.fillText(section.name, (LEFT - 2) * k, (section.y + 3) * k);
+
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
   for (const a of snap.agents) {
     const d = deskXY(seats.get(a.key));
     const cx = (d.x + 20) * k, y = (d.y + 36) * k, maxW = (COL_W - 2) * k;
@@ -493,7 +544,6 @@ function statusLabel(a, st) {
 // ---------- table ----------
 function renderTable() {
   const rows = document.getElementById('rows');
-  const sessions = snap.agents.filter(a => a.kind === 'session').sort((a, b) => a.key.localeCompare(b.key));
   const html = [];
   const row = (a, cls) => {
     const st = visualState(a);
@@ -501,13 +551,17 @@ function renderTable() {
     const dur = a.pendingForMs ? fmtDur(a.pendingForMs) : fmtDur(a.idleForMs);
     html.push(`<tr class="${cls}"><td title="${esc(name)}">${esc(name)}</td><td style="color:${houseOf(a).trim}">${houseOf(a).name}</td><td>${esc(a.project)}${a.branch ? ' <span style="color:var(--muted)">' + esc(a.branch) + '</span>' : ''}</td><td class="state" style="--c:${STATE_COLOR(st === 'asleep' ? 'done' : st)}">${STATE_WORD[st] || st}</td><td class="mono">${esc(a.tool || '')}</td><td>${dur}</td></tr>`);
   };
-  for (const s of sessions) {
-    row(s, '');
-    for (const a of snap.agents.filter(x => x.kind === 'subagent' && x.sessionKey === s.key)) row(a, 'sub');
+  for (const group of projectGroups()) {
+    html.push(`<tr class="project"><td colspan="6">${esc(group.project)}</td></tr>`);
+    for (const s of group.sessions) {
+      row(s, '');
+      for (const a of snap.agents.filter(x => x.kind === 'subagent' && x.sessionKey === s.key)) row(a, 'sub');
+    }
   }
   rows.innerHTML = html.join('');
-  document.getElementById('empty').style.display = sessions.length ? 'none' : 'block';
-  cvs.style.display = sessions.length ? 'block' : 'none';
+  const hasSessions = projectGroups().length > 0;
+  document.getElementById('empty').style.display = hasSessions ? 'none' : 'block';
+  cvs.style.display = hasSessions ? 'block' : 'none';
 }
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 

@@ -3,12 +3,23 @@
 // watch the hall without running real agents:
 //   CLAUDE_PROJECTS_DIR=./demo-projects/claude CURSOR_PROJECTS_DIR=./demo-projects/cursor PORT=7332 node server.mjs &
 //   node demo.mjs
+//
+// The same process serves a local Cloud Agents API mock on 7334. Point the
+// keep at it with CURSOR_API_BASE=http://127.0.0.1:7334 CURSOR_API_KEY=demo-key-not-real
+// `node demo.mjs --check` starts that mock, a temporary server, and checks
+// state, stream resume, the expired-stream fallback, and that prompt text stays out.
 
 import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const ROOT = path.resolve(process.env.DEMO_DIR || 'demo-projects');
-fs.rmSync(ROOT, { recursive: true, force: true });
+const MOCK_TOKEN = 'demo-key-not-real';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const append = (file, obj) => fs.appendFileSync(file, JSON.stringify(obj) + '\n');
@@ -105,6 +116,217 @@ async function cursorDemo() {
   end(sessionFile);
 }
 
-console.log(`demo transcripts -> ${ROOT}`);
-await Promise.all([claudeDemo(), cursorDemo()]);
-console.log('demo finished; both sessions are now waiting for you. Re-run to replay.');
+function cloudItems() {
+  const now = new Date().toISOString();
+  const base = (id, name, status, runId) => ({
+    id, name, status, env: { type: 'cloud' }, url: `https://cursor.com/agents/${id}`,
+    createdAt: now, updatedAt: now, latestRunId: runId,
+    prompt: { text: 'SECRET_PROMPT' },
+  });
+  return {
+    page1: [
+      base('bc-demo-active', 'Demo: watch the cloud hall', 'ACTIVE', 'run-active'),
+      base('bc-demo-idle', 'Demo: idle cloud agent', 'IDLE', 'run-idle'),
+    ],
+    page2: [
+      base('bc-demo-expired', 'Demo: expired stream', 'ACTIVE', 'run-expired'),
+      base('bc-demo-unassigned', 'Demo: no repository yet', 'IDLE', 'run-unassigned'),
+    ],
+  };
+}
+
+function cloudMetadata(id) {
+  const common = { id, status: 'ACTIVE', prompt: { text: 'SECRET_PROMPT' } };
+  if (id === 'bc-demo-active') {
+    return { ...common, name: 'Demo: watch the cloud hall', repos: [{ url: 'https://github.com/acme/acme-web' }], env: { type: 'cloud' } };
+  }
+  if (id === 'bc-demo-idle') {
+    return { ...common, name: 'Demo: idle cloud agent', repos: [], env: { type: 'cloud', name: 'docs-sandbox' } };
+  }
+  if (id === 'bc-demo-expired') {
+    return { ...common, name: 'Demo: expired stream', repos: [{ url: 'https://github.com/acme/cloud-repo.git' }], env: { type: 'cloud' } };
+  }
+  if (id === 'bc-demo-unassigned') {
+    return { ...common, name: 'Demo: no repository yet', repos: [], env: { type: 'cloud' } };
+  }
+  return null;
+}
+
+function sse(res, id, event, data) {
+  res.write(`${id ? `id: ${id}\n` : ''}event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+// A tiny GET-only stand-in for https://api.cursor.com. The first agent list
+// returns 429 once. The active run drops the stream so the client must resume
+// with Last-Event-ID. The other active run answers 410 so the client reads the
+// run instead. Every body includes secret text the keep must not forward.
+function startCloudMock(port) {
+  const methods = [];
+  let listCalls = 0;
+  const items = cloudItems();
+  const server = http.createServer((req, res) => {
+    methods.push(req.method || '');
+    if (req.method !== 'GET') { res.writeHead(405).end(); return; }
+    if (req.headers.authorization !== `Bearer ${MOCK_TOKEN}`) {
+      res.writeHead(401, { 'content-type': 'application/json' }).end(JSON.stringify({ code: 'unauthorized' }));
+      return;
+    }
+    const url = new URL(req.url || '/', 'http://127.0.0.1');
+    if (url.pathname === '/v1/me') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ apiKeyName: 'demo' }));
+      return;
+    }
+    if (url.pathname === '/v1/agents') {
+      listCalls += 1;
+      if (listCalls === 1) {
+        res.writeHead(429, { 'retry-after': '1', 'content-type': 'application/json' }).end(JSON.stringify({ code: 'rate_limit_exceeded', message: 'SECRET_PROMPT' }));
+        return;
+      }
+      const page = url.searchParams.get('cursor') ? items.page2 : items.page1;
+      const body = url.searchParams.get('cursor') ? { items: page } : { items: page, nextCursor: 'page-2' };
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(body));
+      return;
+    }
+    const agent = url.pathname.match(/^\/v1\/agents\/([^/]+)$/);
+    if (agent) {
+      const body = cloudMetadata(agent[1]);
+      res.writeHead(body ? 200 : 404, { 'content-type': 'application/json' })
+        .end(JSON.stringify(body || { code: 'not_found' }));
+      return;
+    }
+    const stream = url.pathname.match(/^\/v1\/agents\/([^/]+)\/runs\/([^/]+)\/stream$/);
+    const run = url.pathname.match(/^\/v1\/agents\/([^/]+)\/runs\/([^/]+)$/);
+    if (stream && stream[1] === 'bc-demo-expired') {
+      res.writeHead(410, { 'content-type': 'application/json' }).end(JSON.stringify({ code: 'stream_expired', message: 'SECRET_STREAM' }));
+      return;
+    }
+    if (run && run[1] === 'bc-demo-expired') {
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        id: 'run-expired', agentId: 'bc-demo-expired', status: 'FINISHED',
+        result: 'SECRET_FINAL',
+        git: { branches: [{ repoUrl: 'github.com/acme/cloud-repo', branch: 'cursor/cloud-demo', prUrl: 'https://github.com/acme/cloud-repo/pull/9' }] },
+      }));
+      return;
+    }
+    if (stream && stream[1] === 'bc-demo-active') {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-store', 'X-Cursor-Stream-Retention-Seconds': '60' });
+      const last = req.headers['last-event-id'];
+      if (!last) {
+        sse(res, '', 'status', { runId: 'run-active', status: 'RUNNING' });
+        sse(res, '1', 'assistant', { text: 'SECRET_ASSISTANT' });
+        sse(res, '2', 'tool_call', { callId: 'c1', name: 'read_file', status: 'running', args: { path: 'SECRET_ARG' }, result: 'SECRET_RESULT' });
+        res.end();
+        return;
+      }
+      sse(res, '', 'status', { runId: 'run-active', status: 'RUNNING' });
+      sse(res, '3', 'thinking', { text: 'SECRET_ASSISTANT' });
+      sse(res, '4', 'tool_call', { callId: 'c1', name: 'read_file', status: 'completed', args: { path: 'SECRET_ARG' }, result: 'SECRET_RESULT' });
+      sse(res, '5', 'tool_call', { callId: 'c2', name: 'run_terminal_cmd', status: 'running', args: { command: 'SECRET_ARG' } });
+      const hb = setInterval(() => res.write('event: heartbeat\ndata: {}\n\n'), 5000);
+      res.on('close', () => clearInterval(hb));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({ code: 'not_found' }));
+  });
+  return new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => resolve({
+      port: server.address().port,
+      methods,
+      close: () => new Promise(r => server.close(() => r())),
+    }));
+  });
+}
+
+const SECRET_BITS = ['SECRET_PROMPT', 'SECRET_ARG', 'SECRET_RESULT', 'SECRET_ASSISTANT', 'SECRET_FINAL', 'SECRET_STREAM', MOCK_TOKEN, 'pull/9', 'github.com/acme'];
+const AGENT_FIELDS = ['key', 'source', 'kind', 'parentKey', 'sessionKey', 'project', 'title', 'agentType', 'branch', 'state', 'tool', 'pendingForMs', 'idleForMs'];
+
+async function checkCloud() {
+  const mock = await startCloudMock(0);
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-keep-'));
+  const serverPort = await new Promise((resolve, reject) => {
+    const probe = http.createServer();
+    probe.once('error', reject);
+    probe.listen(0, '127.0.0.1', () => { const p = probe.address().port; probe.close(() => resolve(p)); });
+  });
+  let logs = '';
+  const child = spawn(process.execPath, ['server.mjs'], {
+    cwd: HERE,
+    env: {
+      ...process.env,
+      PORT: String(serverPort),
+      CURSOR_API_KEY: MOCK_TOKEN,
+      CURSOR_API_BASE: `http://127.0.0.1:${mock.port}`,
+      CLOUD_POLL_MS: '1000',
+      CLAUDE_PROJECTS_DIR: empty,
+      CURSOR_PROJECTS_DIR: empty,
+      CURSOR_STATE_DB: '',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  child.stdout.on('data', d => { logs += d; });
+  child.stderr.on('data', d => { logs += d; });
+  const fail = (message, extra) => {
+    console.error(message);
+    if (extra) console.error(extra);
+    console.error(logs);
+    return message;
+  };
+  let error = '';
+  try {
+    const started = Date.now();
+    let last = '';
+    while (Date.now() - started < 15_000) {
+      await sleep(200);
+      let body = '';
+      try {
+        const res = await fetch(`http://127.0.0.1:${serverPort}/state`);
+        body = await res.text();
+      } catch { continue; }
+      last = body;
+      let snap;
+      try { snap = JSON.parse(body); } catch { continue; }
+      const cloud = (snap.agents || []).filter(a => a.source === 'cursor-cloud');
+      const active = cloud.find(a => a.title === 'Demo: watch the cloud hall');
+      const idle = cloud.find(a => a.title === 'Demo: idle cloud agent');
+      const expired = cloud.find(a => a.title === 'Demo: expired stream');
+      const unassigned = cloud.find(a => a.title === 'Demo: no repository yet');
+      if (!active || active.tool !== 'run_terminal_cmd' || active.state !== 'running') continue;
+      if (!idle || idle.state !== 'waiting' || idle.project !== 'Environment: docs-sandbox') continue;
+      if (active.project !== 'acme-web') continue;
+      if (!expired || expired.state !== 'waiting' || expired.branch !== 'cursor/cloud-demo' || expired.project !== 'cloud-repo') continue;
+      if (!unassigned || unassigned.state !== 'waiting' || unassigned.project !== 'Unassigned') continue;
+      const leaked = SECRET_BITS.filter(bit => body.includes(bit) || logs.includes(bit));
+      if (leaked.length) { error = fail(`leaked ${leaked.join(', ')}`, body); break; }
+      const extra = snap.agents.flatMap(a => Object.keys(a).filter(k => !AGENT_FIELDS.includes(k)));
+      if (extra.length || Object.keys(snap).some(k => k !== 'now' && k !== 'agents')) { error = fail(`unexpected snapshot fields: ${extra.join(', ')}`, body); break; }
+      if (mock.methods.some(m => m !== 'GET')) { error = fail(`non-GET request: ${mock.methods.join(', ')}`); break; }
+      console.log('cloud check ok');
+      console.log(JSON.stringify(cloud, null, 2));
+      return;
+    }
+    if (!error) error = fail('timed out waiting for cloud agents', last);
+  } finally {
+    await new Promise(resolve => {
+      const timer = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 2000);
+      child.once('exit', () => { clearTimeout(timer); resolve(); });
+      child.kill('SIGTERM');
+    });
+    await mock.close();
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
+  process.exit(1);
+}
+
+if (process.argv.includes('--check')) {
+  await checkCloud();
+} else {
+  fs.rmSync(ROOT, { recursive: true, force: true });
+  const mock = await startCloudMock(Number(process.env.CLOUD_MOCK_PORT || 7334));
+  console.log(`demo transcripts -> ${ROOT}`);
+  console.log(`cloud mock -> http://127.0.0.1:${mock.port}`);
+  console.log(`watch it with CURSOR_API_BASE=http://127.0.0.1:${mock.port} CURSOR_API_KEY=${MOCK_TOKEN}`);
+  await Promise.all([claudeDemo(), cursorDemo()]);
+  console.log('demo transcripts finished. Cloud mock is still serving; Ctrl+C to stop. Re-run to replay.');
+  await new Promise(() => {});
+}

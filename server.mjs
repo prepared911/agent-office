@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// The Agent Keep: watches Claude Code and Cursor agent transcripts and streams
-// per-agent state (never transcript content) to a local pixel-art page.
-// Zero dependencies: node built-ins only (node:sqlite for Cursor chat titles).
+// The Agent Keep: watches Claude Code and Cursor agent transcripts, and Cursor
+// cloud agents, and streams per-agent state (never transcript content) to a
+// local pixel-art page.
+// Zero dependencies: node built-ins only (node:sqlite for Cursor chat titles,
+// fetch for the Cloud Agents API).
 
 import fs from 'node:fs';
 import http from 'node:http';
@@ -16,6 +18,11 @@ const CURSOR_DB = process.env.CURSOR_STATE_DB ?? defaultCursorDb();
 const HOST = '127.0.0.1';
 const PORT = Number(process.env.PORT || 7331);
 const SCAN_MS = 700;
+// The Cloud Agents key can also create and cancel agents. This process only
+// ever sends GET, and the poll stays at or below once a second.
+const CURSOR_API_KEY = process.env.CURSOR_API_KEY || '';
+const CURSOR_API_BASE = (process.env.CURSOR_API_BASE || 'https://api.cursor.com').replace(/\/$/, '');
+const CLOUD_POLL_MS = Math.max(1000, Number(process.env.CLOUD_POLL_MS) || 60_000);
 const ACTIVE_MS = Number(process.env.ACTIVE_MINUTES || 30) * 60_000; // hide sessions quiet longer than this
 const TAIL_BYTES = 512 * 1024; // first read of an existing file only looks at its tail
 const DONE_LINGER_MS = 6_000; // finished subagents stay visible briefly before walking out
@@ -142,7 +149,7 @@ function readNewLines(t) {
 /**
  * @typedef {Object} Agent
  * @property {string} key
- * @property {'claude'|'cursor'} source
+ * @property {'claude'|'cursor'|'cursor-cloud'} source
  * @property {'session'|'subagent'} kind
  * @property {string} sessionKey
  * @property {string|null} parentKey
@@ -162,7 +169,9 @@ const TOOL_STATE = {
   Edit: 'typing', MultiEdit: 'typing', Write: 'typing', NotebookEdit: 'typing', StrReplace: 'typing', Delete: 'typing', EditNotebook: 'typing',
   Read: 'reading', ReadFile: 'reading', Grep: 'reading', Glob: 'reading', LS: 'reading', rg: 'reading', ReadLints: 'reading',
   WebFetch: 'reading', WebSearch: 'reading', ToolSearch: 'reading', GetDynamicTools: 'reading', GetMcpTools: 'reading', SearchConversations: 'reading',
+  read_file: 'reading',
   Bash: 'running', BashOutput: 'running', Monitor: 'running', KillShell: 'running', Shell: 'running', AwaitShell: 'running', Await: 'running',
+  run_terminal_cmd: 'running',
   Agent: 'delegating', Task: 'delegating',
   AskUserQuestion: 'waiting', ExitPlanMode: 'waiting', AskQuestion: 'waiting',
   TodoWrite: 'thinking', UpdateCurrentStep: 'thinking', CreatePlan: 'thinking',
@@ -170,7 +179,7 @@ const TOOL_STATE = {
 
 function stateForTool(name) {
   if (TOOL_STATE[name]) return TOOL_STATE[name];
-  if (name.startsWith('mcp__')) return 'reading';
+  if (name === 'mcp' || name.startsWith('mcp__')) return 'reading';
   return 'running';
 }
 
@@ -436,7 +445,7 @@ function snapshot() {
   const now = Date.now();
   return {
     now,
-    agents: [...agents.values()].map(a => {
+    agents: [...agents.values(), ...cloudAgents.values()].map(a => {
       const oldestPending = [...a.pending.values()].reduce((m, p) => Math.min(m, p.ts), Infinity);
       const pendingForMs = Number.isFinite(oldestPending) ? now - oldestPending : 0;
       return {
@@ -456,6 +465,488 @@ function snapshot() {
       };
     }),
   };
+}
+
+// ---------- Cursor cloud agents ----------
+// Polled from the v1 Cloud Agents API. There is no local transcript. A separate
+// map keeps these out of the file scan, which would otherwise prune them.
+
+/** @type {Map<string, Agent>} */
+const cloudAgents = new Map();
+/** @type {Map<string, CloudStream>} agent id -> live run stream */
+const cloudStreams = new Map();
+const cloudMetadataQueue = new Set();
+let cloudMetadataTimer = null;
+let cloudMetadataBusy = false;
+const RUN_TERMINAL = new Set(['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED']);
+
+/**
+ * @typedef {Object} CloudStream
+ * @property {string} runId
+ * @property {AbortController} abort
+ * @property {string} lastEventId
+ * @property {boolean} stopped
+ * @property {boolean} gaveUp
+ * @property {number} attempts
+ * @property {ReturnType<typeof setTimeout>|null} timer
+ */
+
+function cloudKey(id) { return `cursor-cloud:${id}`; }
+
+function retryAfterMs(header) {
+  if (!header) return null;
+  const secs = Number(header);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(header);
+  return Number.isFinite(when) ? Math.max(0, when - Date.now()) : null;
+}
+
+function cursorFetch(pathname, headers, signal) {
+  if (!pathname.startsWith('/v1/')) throw new Error('refusing non-cloud-agent path');
+  return fetch(CURSOR_API_BASE + pathname, {
+    method: 'GET',
+    headers: { Accept: 'application/json', Authorization: `Bearer ${CURSOR_API_KEY}`, ...headers },
+    signal,
+    redirect: 'error',
+  });
+}
+
+async function cursorGetJson(pathname) {
+  const res = await cursorFetch(pathname);
+  const text = await res.text();
+  let body = null;
+  try { body = JSON.parse(text); } catch { body = null; }
+  if (!res.ok) {
+    const err = new Error('Cursor API request failed');
+    err.status = res.status;
+    err.code = body && typeof body.code === 'string' ? body.code : '';
+    err.retryAfterMs = retryAfterMs(res.headers.get('retry-after'));
+    throw err;
+  }
+  return body && typeof body === 'object' ? body : {};
+}
+
+async function drain(res) {
+  try { await res.body?.cancel(); } catch { /* already closed */ }
+}
+
+/** Branch name and repo basename only. Pull-request URLs are not kept. */
+function pickGit(git) {
+  const branches = Array.isArray(git?.branches) ? git.branches : [];
+  for (const b of branches) {
+    if (!b || typeof b.branch !== 'string' || !b.branch) continue;
+    const repo = typeof b.repoUrl === 'string' ? b.repoUrl : '';
+    return { branch: b.branch, project: repo.split('/').filter(Boolean).pop() || '' };
+  }
+  return null;
+}
+
+function applyCloudGit(a, git) {
+  // Full agent metadata is the authoritative grouping source. A run may report
+  // only the repository whose branch was pushed, which would collapse a
+  // multi-repository agent into the wrong section.
+  if (!a.metadataLoaded && git.project && git.project !== a.project) { a.project = git.project; dirty = true; }
+  if (git.branch && git.branch !== a.branch) { a.branch = git.branch; dirty = true; }
+}
+
+function repoName(url) {
+  if (typeof url !== 'string') return '';
+  return url.replace(/\/+$/, '').split('/').filter(Boolean).pop()?.replace(/\.git$/, '') || '';
+}
+
+function projectFromCloudMetadata(body) {
+  const repos = Array.isArray(body.repos) ? body.repos : [];
+  const names = [...new Set(repos.map(r => repoName(r?.url)).filter(Boolean))];
+  if (names.length === 1) return names[0];
+  if (names.length > 1) return `Multi-project: ${names.join(' + ')}`;
+  const envName = typeof body.env?.name === 'string' ? body.env.name.trim() : '';
+  return envName ? `Environment: ${envName}` : 'Unassigned';
+}
+
+async function loadCloudMetadata(a) {
+  if (a.metadataLoaded || a.metadataLoading) return;
+  a.metadataLoading = true;
+  try {
+    const body = await cursorGetJson(`/v1/agents/${encodeURIComponent(a.id)}`);
+    const agent = cloudAgents.get(a.key);
+    if (!agent) return;
+    const project = projectFromCloudMetadata(body);
+    if (project !== agent.project) { agent.project = project; dirty = true; }
+    agent.metadataLoaded = true;
+  } catch (err) {
+    // Retry on the next discovery poll. Metadata failure must not hide the
+    // agent or disturb its live run stream.
+    console.error(`cloud metadata failed: ${err.status || 'offline'}`);
+  } finally {
+    const agent = cloudAgents.get(a.key);
+    if (agent) agent.metadataLoading = false;
+  }
+}
+
+function queueCloudMetadata(a) {
+  if (a.metadataLoaded || a.metadataLoading || cloudMetadataQueue.has(a.key)) return;
+  cloudMetadataQueue.add(a.key);
+  if (!cloudMetadataBusy && !cloudMetadataTimer) cloudMetadataTimer = setTimeout(pumpCloudMetadata, 0);
+}
+
+async function pumpCloudMetadata() {
+  cloudMetadataTimer = null;
+  const key = cloudMetadataQueue.values().next().value;
+  if (!key) return;
+  cloudMetadataQueue.delete(key);
+  const a = cloudAgents.get(key);
+  cloudMetadataBusy = true;
+  try {
+    if (a) await loadCloudMetadata(a);
+  } finally {
+    cloudMetadataBusy = false;
+  }
+  // The standard API limit is 20 requests/minute. Metadata is durable, so
+  // loading one new record every 3.1s is fast enough without a startup burst.
+  if (cloudMetadataQueue.size) cloudMetadataTimer = setTimeout(pumpCloudMetadata, 3100);
+}
+
+function applyCloudRunStatus(a, status) {
+  if (!status) return;
+  if (status === 'CREATING') {
+    a.pending.clear(); a.tool = null; a.state = 'thinking'; a.doneAt = null;
+  } else if (status === 'RUNNING') {
+    a.doneAt = null;
+    if (a.pending.size) setTool(a, [...a.pending.values()].at(-1).name);
+    else if (!a.tool) { a.state = 'running'; a.tool = null; }
+  } else if (RUN_TERMINAL.has(status)) {
+    a.pending.clear(); a.tool = null; a.state = 'waiting'; a.doneAt = null;
+    a.lastTs = Date.now();
+    if (a.runId) a.runSettled = a.runId;
+  }
+  dirty = true;
+}
+
+function cloudIsVisible(item, now) {
+  if (item.status !== 'ACTIVE' && item.status !== 'IDLE') return false;
+  const ts = Date.parse(item.updatedAt);
+  if (item.status !== 'ACTIVE' && Number.isFinite(ts) && now - ts > ACTIVE_MS) return false;
+  return true;
+}
+
+function upsertCloud(item, now) {
+  const key = cloudKey(item.id);
+  const ts = Date.parse(item.updatedAt);
+  const lastTs = Number.isFinite(ts) ? ts : now;
+  let a = cloudAgents.get(key);
+  if (!a) {
+    a = {
+      key, source: 'cursor-cloud', kind: 'session', sessionKey: key, parentKey: null,
+      id: item.id, project: '', title: '', agentType: null, branch: null,
+      state: item.status === 'IDLE' ? 'waiting' : 'thinking',
+      tool: null, pending: new Map(), lastTs, doneAt: null,
+      apiStatus: item.status, runId: item.latestRunId || null,
+      streamExpiredRun: null, needRunRefresh: false, refreshing: false, goneAt: null,
+      metadataLoaded: false, metadataLoading: false,
+    };
+    cloudAgents.set(key, a);
+    dirty = true;
+  }
+  a.goneAt = null;
+  a.apiStatus = item.status;
+  if (typeof item.name === 'string' && item.name && item.name !== a.title) { a.title = item.name; dirty = true; }
+  if (lastTs > a.lastTs) a.lastTs = lastTs;
+  if (item.latestRunId && item.latestRunId !== a.runId) {
+    a.runId = item.latestRunId;
+    a.streamExpiredRun = null;
+    a.needRunRefresh = false;
+    a.runSettled = null;
+    dirty = true;
+  }
+  if (item.status === 'IDLE') {
+    if (a.state !== 'waiting' || a.tool) {
+      a.pending.clear(); a.tool = null; a.state = 'waiting'; a.doneAt = null; dirty = true;
+    }
+  } else if (item.status === 'ACTIVE' && a.state === 'waiting' && a.streamExpiredRun !== a.runId && a.runSettled !== a.runId) {
+    a.state = 'thinking'; a.tool = null; dirty = true;
+  }
+  return a;
+}
+
+function pruneCloud(now) {
+  for (const [key, a] of cloudAgents) {
+    const lingered = a.goneAt && now - a.goneAt > DONE_LINGER_MS;
+    const idleTooLong = a.apiStatus !== 'ACTIVE' && !a.goneAt && now - a.lastTs > ACTIVE_MS;
+    if (lingered || idleTooLong) {
+      stopStream(a.id);
+      cloudAgents.delete(key);
+      dirty = true;
+    }
+  }
+}
+
+async function listCloudAgents() {
+  const items = [];
+  let cursor = '';
+  const seen = new Set();
+  for (let page = 0; page < 20; page++) {
+    const params = new URLSearchParams({ limit: '100', includeArchived: 'false' });
+    if (cursor) {
+      if (seen.has(cursor)) break;
+      seen.add(cursor);
+      params.set('cursor', cursor);
+    }
+    const body = await cursorGetJson(`/v1/agents?${params}`);
+    if (Array.isArray(body.items)) items.push(...body.items);
+    cursor = typeof body.nextCursor === 'string' ? body.nextCursor : '';
+    if (!cursor) break;
+  }
+  return items;
+}
+
+function reconcileCloud(items) {
+  const now = Date.now();
+  const seen = new Set();
+  const visible = [];
+  for (const item of items) {
+    if (!item || typeof item.id !== 'string' || !cloudIsVisible(item, now)) continue;
+    seen.add(item.id);
+    visible.push(item);
+    const a = upsertCloud(item, now);
+    queueCloudMetadata(a);
+  }
+  for (const a of cloudAgents.values()) {
+    if (!seen.has(a.id) && !a.goneAt) {
+      a.goneAt = now;
+      a.state = 'done'; a.tool = null; a.pending.clear(); a.doneAt = now;
+      dirty = true;
+      stopStream(a.id);
+    }
+  }
+  syncCloudStreams(visible);
+  for (const a of cloudAgents.values()) {
+    if (a.needRunRefresh && a.runId) refreshExpiredRun(a.id, a.runId);
+  }
+  pruneCloud(now);
+}
+
+function syncCloudStreams(items) {
+  const wanted = new Map();
+  for (const item of items) {
+    if (item.status === 'ACTIVE' && typeof item.latestRunId === 'string' && item.latestRunId) wanted.set(item.id, item);
+  }
+  for (const [id, handle] of cloudStreams) {
+    const item = wanted.get(id);
+    if (!item || item.latestRunId !== handle.runId) stopStream(id);
+  }
+  for (const [id, item] of wanted) {
+    const a = cloudAgents.get(cloudKey(id));
+    if (a?.streamExpiredRun === item.latestRunId) continue;
+    const handle = cloudStreams.get(id);
+    if (handle && !handle.gaveUp && !handle.abort.signal.aborted) continue;
+    openCloudStream(item);
+  }
+}
+
+function stopStream(agentId) {
+  const handle = cloudStreams.get(agentId);
+  if (!handle) return;
+  handle.stopped = true;
+  if (handle.timer) clearTimeout(handle.timer);
+  handle.abort.abort();
+  cloudStreams.delete(agentId);
+}
+
+function openCloudStream(item) {
+  stopStream(item.id);
+  /** @type {CloudStream} */
+  const handle = {
+    runId: item.latestRunId, abort: new AbortController(), lastEventId: '',
+    stopped: false, gaveUp: false, attempts: 0, timer: null,
+  };
+  cloudStreams.set(item.id, handle);
+  watchStream(item.id, handle);
+}
+
+function delay(ms, handle) {
+  return new Promise(resolve => {
+    if (handle.abort.signal.aborted || handle.stopped) return resolve();
+    handle.timer = setTimeout(resolve, ms);
+    handle.abort.signal.addEventListener('abort', () => { clearTimeout(handle.timer); resolve(); }, { once: true });
+  });
+}
+
+async function watchStream(agentId, handle) {
+  while (!handle.stopped && !handle.abort.signal.aborted && !handle.gaveUp) {
+    let outcome = 'retry';
+    try {
+      outcome = await readCloudStream(agentId, handle);
+      if (outcome === 'stop' || handle.stopped || handle.abort.signal.aborted) return;
+      if (outcome === 'continue') continue;
+      handle.attempts += 1;
+    } catch (err) {
+      if (err?.name === 'AbortError' || handle.abort.signal.aborted) return;
+      handle.attempts += 1;
+      if (handle.attempts > 5) {
+        handle.gaveUp = true;
+        console.error(`cloud stream failed: ${err.status || 'offline'}`);
+        return;
+      }
+    }
+    if (handle.attempts > 5) { handle.gaveUp = true; return; }
+    await delay(Math.min(30_000, 1000 * 2 ** Math.max(0, handle.attempts - 1)), handle);
+  }
+}
+
+/** Keep status, tool name, and branch. Drop assistant text, thinking, and tool payloads at once. */
+function retainSse(block) {
+  let event = 'message';
+  let id = '';
+  const dataLines = [];
+  for (const line of block.split('\n')) {
+    if (!line || line.startsWith(':')) continue;
+    const sep = line.indexOf(':');
+    const field = sep === -1 ? line : line.slice(0, sep);
+    const raw = sep === -1 ? '' : line.slice(sep + 1).replace(/^ /, '');
+    if (field === 'event') event = raw;
+    else if (field === 'id') id = raw;
+    else if (field === 'data') dataLines.push(raw);
+  }
+  let data = {};
+  if (dataLines.length) {
+    try { data = JSON.parse(dataLines.join('\n')); } catch { data = {}; }
+  }
+  const kept = { event, id };
+  if (event === 'tool_call') {
+    kept.callId = typeof data.callId === 'string' ? data.callId : '';
+    kept.name = typeof data.name === 'string' ? data.name : '';
+    kept.status = data.status === 'running' || data.status === 'completed' ? data.status : '';
+  } else if (event === 'status' || event === 'result') {
+    kept.status = typeof data.status === 'string' ? data.status : '';
+    kept.git = pickGit(data.git);
+  } else if (event === 'error') {
+    kept.code = typeof data.code === 'string' ? data.code : '';
+  }
+  return kept;
+}
+
+function applyCloudEvent(agentId, handle, evt) {
+  const a = cloudAgents.get(cloudKey(agentId));
+  if (!a) return;
+  if (evt.event === 'tool_call') {
+    if (!evt.name || !evt.status) return;
+    if (evt.status === 'running') {
+      a.pending.set(evt.callId || 'current', { name: evt.name, ts: Date.now() });
+      setTool(a, evt.name);
+    } else {
+      a.pending.delete(evt.callId || 'current');
+      if (a.pending.size) setTool(a, [...a.pending.values()].at(-1).name);
+      else { a.state = 'thinking'; a.tool = null; a.doneAt = null; }
+    }
+    a.lastTs = Date.now();
+    dirty = true;
+    return;
+  }
+  if (evt.event === 'status' || evt.event === 'result') {
+    if (evt.git) applyCloudGit(a, evt.git);
+    applyCloudRunStatus(a, evt.status);
+    if (RUN_TERMINAL.has(evt.status)) handle.stopped = true;
+    return;
+  }
+  if (evt.event === 'done') handle.stopped = true;
+  else if (evt.event === 'error' && evt.code) console.error(`cloud stream error: ${evt.code}`);
+}
+
+async function readCloudStream(agentId, handle) {
+  const headers = { Accept: 'text/event-stream' };
+  if (handle.lastEventId) headers['Last-Event-ID'] = handle.lastEventId;
+  const pathname = `/v1/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(handle.runId)}/stream`;
+  const res = await cursorFetch(pathname, headers, handle.abort.signal);
+  if (res.status === 410) {
+    await drain(res);
+    handle.stopped = true;
+    await refreshExpiredRun(agentId, handle.runId);
+    return 'stop';
+  }
+  if (res.status === 400 && handle.lastEventId) {
+    await drain(res);
+    handle.lastEventId = '';
+    return 'continue';
+  }
+  if (!res.ok || !res.body) {
+    const wait = res.status === 429 ? retryAfterMs(res.headers.get('retry-after')) : null;
+    await drain(res);
+    if (wait) await delay(wait, handle);
+    return 'retry';
+  }
+  handle.attempts = 0;
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (!handle.abort.signal.aborted) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    let split;
+    while ((split = buf.indexOf('\n\n')) !== -1) {
+      const block = buf.slice(0, split);
+      buf = buf.slice(split + 2);
+      const kept = retainSse(block);
+      if (kept.id) handle.lastEventId = kept.id;
+      applyCloudEvent(agentId, handle, kept);
+    }
+    if (buf.length > 1_048_576) buf = '';
+  }
+  return handle.stopped ? 'stop' : 'retry';
+}
+
+async function refreshExpiredRun(agentId, runId) {
+  const a = cloudAgents.get(cloudKey(agentId));
+  if (!a || a.refreshing) return;
+  a.refreshing = true;
+  a.streamExpiredRun = runId;
+  a.needRunRefresh = false;
+  try {
+    const body = await cursorGetJson(`/v1/agents/${encodeURIComponent(agentId)}/runs/${encodeURIComponent(runId)}`);
+    const status = typeof body.status === 'string' ? body.status : '';
+    const git = pickGit(body.git);
+    delete body.result;
+    delete body.text;
+    const agent = cloudAgents.get(cloudKey(agentId));
+    if (!agent) return;
+    if (git) applyCloudGit(agent, git);
+    applyCloudRunStatus(agent, status);
+  } catch (err) {
+    console.error(`cloud run refresh failed: ${err.status || 'offline'}`);
+    const agent = cloudAgents.get(cloudKey(agentId));
+    if (agent) agent.needRunRefresh = true;
+  } finally {
+    const agent = cloudAgents.get(cloudKey(agentId));
+    if (agent) agent.refreshing = false;
+  }
+}
+
+let cloudTimer = null;
+let cloudAuthChecked = false;
+
+function scheduleCloudPoll(ms) {
+  if (cloudTimer) clearTimeout(cloudTimer);
+  cloudTimer = setTimeout(() => { runCloudPoll(); }, ms);
+}
+
+async function runCloudPoll() {
+  try {
+    if (!cloudAuthChecked) {
+      await cursorGetJson('/v1/me');
+      cloudAuthChecked = true;
+    }
+    reconcileCloud(await listCloudAgents());
+    scheduleCloudPoll(CLOUD_POLL_MS);
+  } catch (err) {
+    console.error(`cloud poll failed: ${err.status || 'offline'}${err.code ? ' ' + err.code : ''}`);
+    if (err.status === 401 || err.status === 403) return;
+    scheduleCloudPoll(err.retryAfterMs || CLOUD_POLL_MS);
+  }
+}
+
+function startCloud() {
+  if (!CURSOR_API_KEY) return;
+  scheduleCloudPoll(0);
 }
 
 // ---------- http + SSE ----------
@@ -509,7 +1000,7 @@ const server = http.createServer((req, res) => {
 
 let ticks = 0;
 setInterval(() => {
-  try { scan(); } catch (err) { console.error('scan failed:', err); }
+  try { scan(); pruneCloud(Date.now()); } catch (err) { console.error('scan failed:', err); }
   ticks++;
   // Push on change, plus every ~3s so "for 42s" counters keep moving.
   if (dirty || ticks % 4 === 0) {
@@ -533,5 +1024,9 @@ server.listen(PORT, HOST, () => {
   console.log(`The Agent Keep is watching:`);
   console.log(`  Claude Code  ${CLAUDE_ROOT}`);
   console.log(`  Cursor       ${CURSOR_ROOT}${sqlite && fs.existsSync(CURSOR_DB) ? '' : '  (chat titles unavailable)'}`);
+  console.log(CURSOR_API_KEY
+    ? `  Cursor Cloud ${CURSOR_API_BASE} every ${CLOUD_POLL_MS / 1000}s`
+    : '  Cursor Cloud off (set CURSOR_API_KEY)');
   console.log(`Open http://${HOST}:${PORT}`);
 });
+startCloud();
